@@ -1,0 +1,354 @@
+---
+title: "South African Economic & Inflation Analysis"
+subtitle: "Inflation, growth, unemployment and the repo rate, 2000-2024"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    number_sections: true
+    theme: flatly
+    df_print: kable
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5, fig.align = "center")
+.root <- getwd()
+while (!length(list.files(.root, "\\.Rproj$")) && dirname(.root) != .root) .root <- dirname(.root)
+source(file.path(.root, "R", "utils.R"))
+for (f in c("exploratory_analysis", "descriptive_statistics", "correlation_analysis",
+            "hypothesis_testing", "regression_analysis", "time_series_analysis", "model_evaluation")) {
+  source(file.path(.root, "R", paste0(f, ".R")))
+}
+library(knitr)
+
+df        <- load_economic_data()
+register  <- readr::read_csv(file.path(PATHS$raw, "data_sources.csv"), show_col_types = FALSE)
+quality   <- readr::read_csv(file.path(PATHS$processed, "data_quality_report.csv"), show_col_types = FALSE)
+
+# All results are recomputed here from the processed data (the run_* functions
+# also refresh the tables in outputs/ and figures in visualisations/).
+eda   <- run_exploratory_analysis(df)
+desc  <- run_descriptive_statistics(df)
+corr  <- run_correlation_analysis(df)
+hyp   <- run_hypothesis_tests(df)
+reg   <- run_regression_analysis(df)
+tsa   <- run_time_series_analysis(df)
+evals <- run_model_evaluation(df)
+
+r2 <- function(x, d = 2) formatC(x, format = "f", digits = d)
+pv <- function(p) ifelse(p < 0.001, "p < 0.001", sprintf("p = %.3f", p))
+esc_dollar <- function(df) dplyr::mutate(df, dplyr::across(where(is.character), ~ gsub("$", "\\$", .x, fixed = TRUE)))
+ds <- function(v, stat) desc$overall[[stat]][desc$overall$variable == v]
+ct <- function(form, x, y) corr$tests |> filter(data_form == form, .data$x == !!x, .data$y == !!y)
+ht <- function(prefix) hyp$results |> filter(startsWith(test, prefix))
+cf <- function(m, term) reg$coefficients |> filter(model == m, .data$term == !!term)
+dg <- function(m) reg$diagnostics |> filter(model == m)
+acc <- function(ev, m) evals$forecasting$accuracy |> filter(evaluation == ev, method == m)
+
+ext <- eda$extremes
+infl_cor  <- ct("Levels", "Interest_Rate", "Inflation")
+infl_cord <- ct("First differences", "Interest_Rate", "Inflation")
+gdpu_cor  <- ct("Levels", "GDP_Growth", "Unemployment")
+gdpu_cord <- ct("First differences", "GDP_Growth", "Unemployment")
+t1 <- ht("T1"); t2 <- ht("T2"); t3 <- ht("T3"); t4 <- ht("T4"); t5 <- ht("T5")
+target <- desc$target
+```
+
+# Introduction
+
+Inflation, unemployment, economic growth and interest rates shape household purchasing power, business decisions and government policy. South Africa has combined persistently high unemployment with slow growth since the 2009 global financial crisis (GFC), while the South African Reserve Bank (SARB) has targeted consumer inflation of 3-6% since 2000.
+
+This report uses annual data for `r CONFIG$start_year`-`r CONFIG$end_year` to describe how these indicators have behaved and how they relate to one another. It applies descriptive statistics, correlation analysis, hypothesis tests, regression and time-series methods. All results are reproducible from the code in `R/`.
+
+# Research questions
+
+1. How has inflation behaved since 2000, and how often has it been inside the SARB 3-6% target range?
+2. How have GDP growth and unemployment changed, and did growth differ before and after the GFC?
+3. Is inflation associated with the repo rate, GDP growth or unemployment?
+4. Is unemployment associated with GDP growth?
+5. Can a simple time-series model forecast annual inflation better than naive benchmarks?
+
+# Data
+
+## Sources
+
+```{r sources}
+register |>
+  select(Variable = variable, Source = source, Code = indicator_code,
+         Indicator = indicator_name, Frequency = frequency, Units = units,
+         `Source updated` = source_last_updated) |>
+  esc_dollar() |>
+  kable()
+```
+
+* **World Bank World Development Indicators** provided inflation (CPI, annual %), real GDP growth, unemployment (ILO modelled estimate), population growth and GDP per capita (current US$). Files were downloaded as bulk CSVs and are stored unchanged in `data/raw/world_bank/`.
+* **SARB Web API** provided the daily SARB policy (repo) rate (series `MMRD002A`), stored unchanged as JSON in `data/raw/sarb/`.
+
+Unemployment is the ILO modelled estimate published by the World Bank. Its level and definition differ somewhat from Statistics South Africa's Quarterly Labour Force Survey official rate. The World Bank inflation series is the annual change in the CPI. It is based on Stats SA data but can differ slightly from Stats SA's published annual averages.
+
+## Cleaning methodology
+
+* World Bank files were filtered to South Africa (`ZAF`) and reshaped from one column per year to one row per year. Values were parsed as numbers, and blanks became `NA`.
+* The repo rate is a step function that changes only at Monetary Policy Committee decisions. Daily observations were expanded to every calendar day, carrying the last rate forward. They were then averaged over each calendar year to give a time-weighted annual rate. The year-end rate is kept as a separate column.
+* Datasets were joined on `Year` and restricted to `r CONFIG$start_year`-`r CONFIG$end_year`, the longest period covered by every World Bank indicator.
+* Missing values were **not** replaced. The SARB API series begins on 31 December 2001, so the annual-average repo rate for 2000 and 2001 is missing. Analyses involving the repo rate therefore use `r sum(!is.na(df$Interest_Rate))` years (2002-2024).
+* Checks were run for missing values, duplicate years, column types and values outside plausible ranges.
+
+```{r quality}
+quality |>
+  select(Variable = variable, Years = n_years, Missing = n_missing, `Missing years` = missing_years,
+         `Out of range` = n_out_of_range, Duplicates = duplicate_years, Type = type,
+         `Source coverage` = source_first_year) |>
+  mutate(`Source coverage` = paste0(`Source coverage`, "-", quality$source_last_year),
+         `Missing years` = tidyr::replace_na(`Missing years`, "none")) |>
+  kable(caption = "Data-quality checks for the analysis window")
+```
+
+No duplicate years, wrong types or implausible values were found.
+
+# Exploratory data analysis
+
+```{r eda-overview, fig.height=7}
+eda$plots$core_indicators
+```
+
+```{r eda-inflation}
+eda$plots$inflation_trend
+```
+
+**Inflation.** Inflation peaked at `r r2(ext$max_value[1])`% in `r ext$max_year[1]`, during the global food and fuel price shock, and fell to `r r2(ext$min_value[1])`% in `r ext$min_year[1]`. The 2004 low followed the strong rand recovery after the 2001-2002 currency crisis, which had itself pushed inflation to 9.5% in 2002. Inflation rose again after COVID-19 (7.0% in 2022) and eased to `r r2(ext$last_value[1])`% in 2024.
+
+```{r eda-gdp}
+eda$plots$gdp_growth_trend
+```
+
+**GDP growth.** Growth averaged above 4% before the GFC. It contracted in 2009 and stayed weak afterwards, mostly between 0% and 3%. The largest contraction was `r r2(ext$min_value[2])`% in `r ext$min_year[2]` (COVID-19 lockdown), followed by a rebound in 2021.
+
+```{r eda-unemp}
+eda$plots$unemployment_trend
+```
+
+**Unemployment.** Unemployment was roughly flat near 22-23% until 2008. It then rose almost every year to a peak of `r r2(ext$max_value[3])`% in `r ext$max_year[3]`, the year after the COVID-19 shock.
+
+```{r eda-repo}
+eda$plots$interest_rate_trend
+```
+
+**Repo rate.** The repo rate averaged above 11% in 2002 and 2008 and was cut sharply during the GFC. It reached a low of `r r2(ext$min_value[4])`% in `r ext$min_year[4]` and was raised again during 2022-2023 as inflation picked up.
+
+```{r eda-scatter, fig.height=4.8}
+eda$plots$inflation_vs_interest
+eda$plots$inflation_vs_unemployment
+eda$plots$gdp_vs_unemployment
+```
+
+The scatterplots colour points by year. The GDP-unemployment plot shows that the negative pattern in levels comes mostly from the shift between eras: high growth with lower unemployment before 2009, and low growth with higher unemployment afterwards.
+
+# Descriptive statistics
+
+```{r desc}
+desc$overall |>
+  select(Indicator = label, n, Mean = mean, Median = median, SD = sd, Variance = variance,
+         Min = min, Q1 = q1, Q3 = q3, Max = max, Skew = skewness, Kurtosis = kurtosis) |>
+  kable(digits = 2)
+```
+
+```{r desc-box, fig.height=4}
+desc$boxplot
+```
+
+* Inflation averaged `r r2(ds("Inflation", "mean"))`% (SD `r r2(ds("Inflation", "sd"))` pp), which is above the 4.5% midpoint of the target range. It was within 3-6% in `r target$years[target$position == "Within 3-6%"]` of 25 years, above 6% in `r target$years[target$position == "Above 6%"]` years and below 3% in `r target$years[target$position == "Below 3%"]`.
+* GDP growth averaged `r r2(ds("GDP_Growth", "mean"))`%. It is the most variable core indicator relative to its mean (coefficient of variation `r r2(ds("GDP_Growth", "cv"))`) and is negatively skewed (`r r2(ds("GDP_Growth", "skewness"))`) because of the 2009 and 2020 contractions.
+* Unemployment averaged `r r2(ds("Unemployment", "mean"))`% and is positively skewed, because the high values are concentrated in recent years.
+* The repo rate averaged `r r2(ds("Interest_Rate", "mean"))`% over 2002-2024 (range `r r2(ds("Interest_Rate", "min"))`-`r r2(ds("Interest_Rate", "max"))`%).
+
+```{r desc-period}
+desc$by_period |> kable(digits = 2, caption = "Core indicators before and after the GFC")
+```
+
+# Correlation analysis
+
+Shapiro-Wilk tests suggest GDP growth and unemployment depart from normality, so Spearman rank correlations are reported alongside Pearson correlations. The indicators trend over time, which can create correlation between unrelated series. Correlations were therefore also computed on first differences (year-on-year changes).
+
+```{r normality}
+corr$normality |> kable(digits = 3, caption = "Shapiro-Wilk normality tests (H0: normal)")
+```
+
+```{r cor-plots, out.width="49%", fig.show="hold"}
+include_graphics(file.path(PATHS$visualisations, "correlation_pearson.png"))
+include_graphics(file.path(PATHS$visualisations, "correlation_pearson_differences.png"))
+```
+
+```{r cor-tests}
+corr$tests |>
+  select(Data = data_form, Question = question, n, `Pearson r` = pearson_r,
+         `95% CI low` = pearson_ci_low, `95% CI high` = pearson_ci_high,
+         `Pearson p` = pearson_p, `Spearman rho` = spearman_rho, `Spearman p` = spearman_p) |>
+  kable(digits = 3)
+```
+
+* **Inflation and the repo rate** are moderately positively correlated in levels (r = `r r2(infl_cor$pearson_r)`, p = `r fmt_p(infl_cor$pearson_p)`). The rank correlation is weaker and not significant (rho = `r r2(infl_cor$spearman_rho)`). In first differences the association is stronger (r = `r r2(infl_cord$pearson_r)`, p = `r fmt_p(infl_cord$pearson_p)`): years when inflation rose tended to be years when the repo rate rose. This fits a central bank that raises rates in response to inflation. It does not show that higher rates cause higher inflation.
+* **GDP growth and unemployment.** In levels, the Pearson correlation is borderline (r = `r r2(gdpu_cor$pearson_r)`, p = `r fmt_p(gdpu_cor$pearson_p)`) and the Spearman correlation is strongly negative (rho = `r r2(gdpu_cor$spearman_rho)`). Both reflect the shift between eras described above. In first differences the Pearson correlation is *positive* (r = `r r2(gdpu_cord$pearson_r)`) while Spearman is near zero. That positive value is driven by 2020-2021, when growth collapsed and then rebounded while measured unemployment rose with a lag. Without that episode, there is no reliable year-to-year Okun's-law relationship in these annual data.
+* **Inflation** shows no meaningful correlation with GDP growth or unemployment in either form. The data give no support for a simple Phillips-curve trade-off.
+
+# Hypothesis testing
+
+All tests use α = `r CONFIG$alpha`. Two-group comparisons use Welch's t-test, which does not assume equal variances, plus the Wilcoxon rank-sum test as a distribution-free check. Effect sizes are Hedges' g. Annual observations are serially correlated, so the independence assumption holds only approximately and p-values should be treated as indicative.
+
+```{r hyp}
+hyp$results |>
+  select(Test = test, n1 = n_1, n2 = n_2, `Mean 1` = mean_1, `Mean 2` = mean_2,
+         `Diff / r` = difference, `CI low` = ci_low, `CI high` = ci_high, p = p_value,
+         `Wilcoxon p` = wilcoxon_p, `Effect` = effect_size, Magnitude = effect_magnitude,
+         Decision = decision) |>
+  kable(digits = 3)
+```
+
+```{r hyp-plot, fig.height=4.5, fig.width=11}
+hyp$plot
+```
+
+* **T1, inflation in high vs low unemployment years** (median split at `r r2(hyp$unemployment_median)`%). Mean inflation was `r r2(t1$mean_1)`% vs `r r2(t1$mean_2)`% (p = `r fmt_p(t1$p_value)`, g = `r r2(t1$effect_size)`). We fail to reject H0. Unemployment rose steadily, so the split is close to a split by time: all 12 high-unemployment years are after 2009. The test therefore partly compares eras rather than unemployment regimes.
+* **T2, GDP growth before vs after the GFC.** Growth averaged `r r2(t2$mean_1)`% in 2000-2008 and `r r2(t2$mean_2)`% in 2009-2024, a difference of `r r2(t2$difference)` pp (95% CI `r r2(t2$ci_low)` to `r r2(t2$ci_high)`, `r pv(t2$p_value)`, Wilcoxon `r pv(t2$wilcoxon_p)`). The effect is large (g = `r r2(t2$effect_size)`), so we reject H0. The post-GFC group fails the normality check because of the 2020 outlier, but the Wilcoxon test gives the same conclusion.
+* **T3, inflation before vs after the GFC.** There is no difference in means (p = `r fmt_p(t3$p_value)`). However, Levene's test shows that the *variability* of inflation differs (p = `r fmt_p(t3$levene_p)`). The SD fell from `r r2(desc$by_period$sd[desc$by_period$variable == "Inflation" & startsWith(desc$by_period$Period, "Pre")])` pp before 2009 to `r r2(desc$by_period$sd[desc$by_period$variable == "Inflation" & startsWith(desc$by_period$Period, "Post")])` pp afterwards, so inflation became more stable even though its average did not change. This is why Welch's test, which allows unequal variances, was used.
+* **T4, correlation of inflation and repo rate.** r = `r r2(t4$difference)`, p = `r fmt_p(t4$p_value)`. This narrowly rejects H0: ρ = 0, but the confidence interval (`r r2(t4$ci_low)` to `r r2(t4$ci_high)`) is wide.
+* **T5, mean inflation vs the 4.5% target midpoint.** Mean inflation was `r r2(t5$difference)` pp above the midpoint. The t-test does not reject H0 (p = `r fmt_p(t5$p_value)`), while the Wilcoxon signed-rank test does (p = `r fmt_p(t5$wilcoxon_p)`). The evidence that inflation has averaged above the midpoint is weak to moderate.
+
+# Regression analysis
+
+Three models were estimated. Models 1 and 2 use levels, as specified in the project brief. Model 3 re-estimates Model 2 in first differences, because the stationarity tests below show that unemployment and the repo rate are non-stationary in levels.
+
+```{r reg-coef}
+reg$coefficients |>
+  mutate(model = MODEL_DESCRIPTIONS[model]) |>
+  select(Model = model, Term = term, Estimate = estimate, SE = std.error, p = p.value,
+         `HAC SE` = hac_std_error, `HAC p` = hac_p_value) |>
+  kable(digits = 3, caption = "Coefficients with OLS and Newey-West (HAC) standard errors")
+```
+
+```{r reg-diag}
+reg$diagnostics |>
+  select(Model = description, n, R2 = r_squared, `Adj R2` = adj_r_squared, `F p` = f_p_value,
+         MAE = in_sample_mae, RMSE = in_sample_rmse, `Shapiro p` = shapiro_p,
+         `BP p` = breusch_pagan_p, DW = durbin_watson, `BG p` = breusch_godfrey_p,
+         `RESET p` = reset_p, `Max VIF` = max_vif) |>
+  kable(digits = 3, caption = "Fit and assumption checks")
+```
+
+```{r reg-resid, fig.height=7}
+reg$residual_plot
+```
+
+**Interpretation**
+
+* **Model 1** (Inflation ~ Repo rate): each 1 pp higher average repo rate is associated with `r r2(cf("model1", "Interest_Rate")$estimate)` pp higher inflation (HAC p = `r fmt_p(cf("model1", "Interest_Rate")$hac_p_value)`). The model explains `r r2(100 * dg("model1")$r_squared, 0)`% of the variation.
+* **Model 2** adds GDP growth and unemployment. Neither is significant. Adjusted R² *falls* to `r r2(dg("model2")$adj_r_squared)`, and the overall F-test is not significant (p = `r fmt_p(dg("model2")$f_p_value)`).
+* **Assumptions.** Residuals are approximately normal (Shapiro p > 0.05), homoscedastic (Breusch-Pagan p > 0.05) and free of serious multicollinearity (maximum VIF `r r2(dg("model2")$max_vif)`). However, the levels models show strong positive **autocorrelation** (Durbin-Watson ≈ `r r2(dg("model1")$durbin_watson)`, Breusch-Godfrey p < 0.05). Their ordinary standard errors are therefore unreliable, and the Newey-West HAC standard errors are the better guide.
+* **Model 3** (first differences) has no residual autocorrelation (DW = `r r2(dg("model3")$durbin_watson)`, BG p = `r fmt_p(dg("model3")$breusch_godfrey_p)`). A 1 pp change in the repo rate is associated with a `r r2(cf("model3", "d_Interest_Rate")$estimate)` pp change in inflation in the same year (p < 0.001), and R² = `r r2(dg("model3")$r_squared)`.
+
+**Causal caution.** The positive repo-rate coefficient should not be read as "higher interest rates raise inflation". The SARB sets the repo rate *in response to* current and expected inflation, so causality runs at least partly from inflation to rates (reverse causality). Monetary policy also affects inflation with a lag of one to two years, which these contemporaneous models do not capture. These regressions describe association only.
+
+# Time-series analysis
+
+```{r ts-ma}
+tsa$plots$ma
+```
+
+```{r ts-trends}
+tsa$trends |>
+  mutate(variable = INDICATOR_LABELS[variable]) |>
+  kable(digits = 3, col.names = c("Indicator", "Slope (pp per year)", "HAC p", "R²"),
+        caption = "Linear time trends")
+```
+
+Inflation has no time trend (slope ≈ 0). Unemployment has risen by about `r r2(tsa$trends$slope_per_year[tsa$trends$variable == "Unemployment"])` pp per year (R² = `r r2(tsa$trends$r_squared[tsa$trends$variable == "Unemployment"])`). GDP growth and the repo rate have trended downward.
+
+```{r ts-decomp, fig.height=7, fig.width=12}
+tsa$plots$decomposition
+```
+
+Annual data contain no seasonal component, so the decomposition separates a smooth LOESS trend from the remaining cyclical and irregular movements.
+
+```{r ts-acf, fig.height=3.5, out.width="49%", fig.show="hold"}
+tsa$plots$acf
+tsa$plots$pacf
+```
+
+```{r ts-stationarity}
+tsa$stationarity |>
+  select(Indicator = variable, Form = form, n, `ADF stat` = adf_statistic, `ADF p` = adf_p,
+         `KPSS stat` = kpss_statistic, `KPSS p` = kpss_p, Conclusion = conclusion) |>
+  kable(digits = 3, caption = "ADF (H0: unit root) and KPSS (H0: stationary) tests")
+```
+
+* **Inflation** is stationary in levels: it reverts to a stable mean of about 5%, consistent with inflation targeting. Its lag-1 autocorrelation (`r r2(tsa$acf$Inflation$table$acf[1])`) is positive but inside the 95% bounds (±`r r2(tsa$acf$Inflation$table$bound_95[1])`). The only clearly significant value is a negative partial autocorrelation at lag 2 (`r r2(tsa$acf$Inflation$table$pacf[2])`), reflecting the roughly 3-4-year cycle of inflation episodes. Persistence across years is weak, which points to a low-order ARMA model.
+* **Unemployment** and the **repo rate** are non-stationary in levels and stationary in first differences. This supports differencing them before regression (Model 3).
+* **GDP growth** appears non-stationary in levels. This most likely reflects the structural break in average growth after 2009 (see T2) rather than a true unit root, since unit-root tests confuse breaks with unit roots, especially in short samples.
+* With 22-25 observations these tests have low power, and the conclusions are tentative.
+
+# Model evaluation
+
+## Regression out of sample
+
+The models were refitted on 2000-2018 and scored on 2019-2024 (chronological split, no random sampling). They use same-year regressor values, so this tests how stable the fitted relationship is, not real forecasting ability.
+
+```{r eval-reg}
+evals$regression |>
+  select(Model = model, Method = method, `Train R2` = train_r_squared,
+         `Train adj R2` = train_adj_r_squared, `Test n` = n, MAE, RMSE, `MAPE %` = MAPE) |>
+  kable(digits = 3)
+```
+
+Only Model 1 slightly beats the training-mean baseline on MAE. Models 2 and 3 fit the training years better but perform much worse on the test years: the 2020-2021 shocks to GDP growth and unemployment push their predictions far from actual inflation. The relationships are not stable enough to be used for prediction.
+
+## Inflation forecasting
+
+```{r eval-fc}
+evals$plots$evaluation
+evals$forecasting$accuracy |> kable(digits = 3, caption = "Forecast accuracy on 2019-2024")
+```
+
+On the 2000-2018 training data, `auto.arima` selected **`r evals$forecasting$arima_label`**. Over the six-year multi-step horizon, the naive forecast (last observed value) had the lowest MAE (`r r2(acc("Multi-step (2019-2024)", "Naive")$MAE)` vs `r r2(acc("Multi-step (2019-2024)", "ARIMA")$MAE)` for ARIMA). With rolling one-step-ahead forecasts, ARIMA was best (MAE `r r2(acc("Rolling one-step (2019-2024)", "ARIMA")$MAE)` vs `r r2(acc("Rolling one-step (2019-2024)", "Naive")$MAE)` naive and `r r2(acc("Rolling one-step (2019-2024)", "Mean")$MAE)` mean). ARIMA residuals pass the Ljung-Box test (p = `r fmt_p(evals$forecasting$residual_ljung_box$p_value)`), so no autocorrelation remains.
+
+```{r eval-final}
+evals$plots$final
+evals$final$table |> select(-model) |>
+  kable(digits = 2, caption = paste("Forecast from", evals$final$table$model[1], "fitted on 2000-2024"))
+```
+
+Refitted on all years, the selected model is `r evals$final$table$model[1]`. Inflation is forecast to stay close to its long-run mean of about 5%. The 95% intervals are wide (roughly 1-10%). With annual data and only six test years, this forecast is indicative only. A monthly CPI series would support a more reliable forecasting model.
+
+# Findings
+
+1. **Inflation is mean-reverting and has no trend.** It averaged `r r2(ds("Inflation", "mean"))`% and was inside the 3-6% target range in 60% of years. Breaches were mostly tied to identifiable shocks (rand depreciation in 2002, food and fuel prices in 2008, post-COVID prices in 2022).
+   Inflation was also much less volatile after 2009 than before (SD about 1.2 vs 3.4 pp).
+2. **Growth shifted down after the GFC.** Average real GDP growth fell from about 4.2% to 1.1% (p < 0.001, large effect), and unemployment rose by about 10 pp.
+3. **Inflation and the repo rate move together**, most clearly in year-on-year changes (r = `r r2(infl_cord$pearson_r)`). This is consistent with the SARB responding to inflation, not evidence that rates cause inflation.
+4. **There is no reliable link between inflation and unemployment or growth** in these annual data.
+5. **Simple regressions are weak and unstable.** The levels models have autocorrelated residuals, and none of the models generalised well to 2019-2024.
+6. **Forecasting** gains little over naive benchmarks at multi-year horizons. A low-order ARIMA helps slightly for one-step-ahead forecasts.
+
+# Limitations
+
+* **Small sample.** 25 annual observations (23 for the repo rate) give low statistical power and limit model complexity.
+* **Repo rate coverage.** The SARB API series starts in December 2001, so the 2000-2001 annual averages are missing.
+* **Definitions.** World Bank ILO-modelled unemployment differs from Stats SA's official QLFS rate. Official statistics are also revised over time.
+* **Structural breaks and shocks** (GFC, COVID-19) dominate short samples and violate the assumption of stable relationships.
+* **Autocorrelation and endogeneity.** Serial correlation affects the tests and levels regressions. Monetary policy reacts to inflation, so the regressions cannot identify causal effects.
+* **Omitted variables.** The exchange rate, oil and food prices, fiscal policy, electricity supply (load-shedding) and global conditions are not modelled.
+
+# Conclusion
+
+South Africa's inflation has been anchored around 5% since 2000 despite large shocks, while growth fell sharply and unemployment rose after the 2009 financial crisis. Inflation moves with the repo rate in a way that reflects the SARB's policy response, and it shows no stable trade-off with unemployment or growth. These results are statistical associations from a short annual sample, not causal estimates. Natural extensions are quarterly or monthly data, lagged-policy models, and VAR or VECM approaches that model the feedback between inflation and interest rates.
+
+# Reproducibility {.unnumbered}
+
+Run `Rscript run_analysis.R` from the project root, then render this file. Package versions are recorded in `renv.lock` and `outputs/session_info.txt`.
+
+```{r session}
+cat(paste("R version:", R.version.string, "| Rendered:", format(Sys.time(), "%Y-%m-%d %H:%M")))
+```

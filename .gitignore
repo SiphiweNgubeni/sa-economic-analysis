@@ -1,0 +1,23 @@
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj.user
+
+# renv (the lockfile is committed; the library is not)
+renv/library/
+renv/staging/
+renv/local/
+renv/cellar/
+renv/python/
+
+# Rendered report intermediates
+reports/*_files/
+reports/*_cache/
+reports/*.knit.md
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini

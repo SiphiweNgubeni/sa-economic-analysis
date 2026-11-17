@@ -1,0 +1,7 @@
+model,term,vif
+model2,Interest_Rate,1.3581252298682498
+model2,GDP_Growth,1.1686339465871958
+model2,Unemployment,1.4647967386849265
+model3,d_Interest_Rate,1.1128205275668284
+model3,d_GDP_Growth,1.6070700419963255
+model3,d_Unemployment,1.74742947013118

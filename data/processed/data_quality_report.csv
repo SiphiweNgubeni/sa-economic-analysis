@@ -1,0 +1,7 @@
+variable,n_years,n_missing,missing_years,first_year,last_year,n_out_of_range,type,duplicate_years,source_first_year,source_last_year
+GDP_Growth,25,0,,2000,2024,0,numeric,0,1961,2025
+GDP_Per_Capita,25,0,,2000,2024,0,numeric,0,1960,2025
+Inflation,25,0,,2000,2024,0,numeric,0,1960,2025
+Interest_Rate,25,2,"2000, 2001",2002,2024,0,numeric,0,2001,2026
+Population_Growth,25,0,,2000,2024,0,numeric,0,1961,2025
+Unemployment,25,0,,2000,2024,0,numeric,0,1991,2025
